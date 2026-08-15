@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetTop="21dp"
+    android:insetBottom="21dp"
+    android:insetLeft="21dp"
+    android:insetRight="21dp">
+    <!-- Keep the complete official HAM artwork within Android's 66dp adaptive-icon safe zone. -->
+    <bitmap
+        android:src="@drawable/ham_launcher_art"
+        android:gravity="fill"
+        android:filter="true" />
+</inset>
