@@ -301,6 +301,14 @@ interface HermesConnectionClient {
         profile: String,
     ): ModelOptions = throw UnsupportedOperationException()
 
+    suspend fun loadProfileReasoningEffort(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+        provider: String,
+        model: String,
+    ): String? = null
+
     suspend fun setDefaultModel(
         serverOrigin: ServerOrigin,
         accessToken: String,
@@ -465,6 +473,48 @@ class HttpHermesConnectionClient(
             } else null,
             providers = providers,
         )
+    }
+
+    override suspend fun loadProfileReasoningEffort(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+        provider: String,
+        model: String,
+    ): String? {
+        val response = client.get("${serverOrigin.value}/api/config") {
+            bearerAuth(accessToken)
+            parameter("profile", profile.take(64))
+        }
+        val body = response.readBodyTextBounded()
+        if (!response.status.isSuccess()) {
+            throw HermesConnectionException("Hermes config returned HTTP ${response.status.value}")
+        }
+        val root = json.parseToJsonElement(body) as? JsonObject
+            ?: throw HermesConnectionException("Hermes config response was invalid")
+        val agent = root["agent"] as? JsonObject ?: return null
+        val overrides = agent["reasoning_overrides"] as? JsonObject
+        val bareModelVariants = reasoningBareModelVariants(model)
+        val normalizedProvider = provider.trim().lowercase()
+        val qualifiedVariants = bareModelVariants.mapTo(mutableSetOf()) {
+            "$normalizedProvider/$it"
+        }
+        val normalizedModel = model.trim().lowercase()
+        if (normalizedModel.startsWith("$normalizedProvider/")) {
+            qualifiedVariants += normalizedModel
+        }
+        fun matchingOverride(keys: Set<String>): String? = overrides
+            ?.entries
+            ?.firstOrNull { (key, _) -> key.trim().lowercase() in keys }
+            ?.value
+            ?.jsonPrimitive
+            ?.contentOrNull
+        val override = matchingOverride(qualifiedVariants)
+            ?: matchingOverride(bareModelVariants)
+        return canonicalProfileReasoningEffort(override)
+            ?: canonicalProfileReasoningEffort(
+                agent["reasoning_effort"]?.jsonPrimitive?.contentOrNull,
+            )
     }
 
     override suspend fun setDefaultModel(
@@ -833,6 +883,35 @@ class HttpHermesConnectionClient(
             .take(MAX_DURABLE_SESSIONS)
         return sessions
     }
+}
+
+private val profileReasoningEfforts = setOf(
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+private fun canonicalProfileReasoningEffort(value: String?): String? {
+    val normalized = value?.trim()?.lowercase()?.takeIf(String::isNotEmpty) ?: return null
+    return when (normalized) {
+        "none", "false", "disabled", "off", "no" -> "none"
+        in profileReasoningEfforts -> normalized
+        else -> null
+    }
+}
+
+private fun reasoningBareModelVariants(value: String): Set<String> {
+    val bare = value.trim().lowercase().substringAfterLast('/')
+    if (bare.isEmpty()) return emptySet()
+    return setOf(
+        bare,
+        bare.replace('.', '-'),
+        bare.replace('-', '.'),
+    )
 }
 
 private fun validManagedDirectoryEntryName(name: String): String? {

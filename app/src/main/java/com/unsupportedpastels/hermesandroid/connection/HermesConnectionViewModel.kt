@@ -1356,10 +1356,13 @@ class HermesConnectionViewModel(
                     title = title,
                     projectId = null,
                     workspacePath = null,
+                    profile = snapshot.selectedProfile,
                     isLocalDraft = true,
                 ),
             ) + snapshot.durableSessions,
+            chatSessions = snapshot.chatSessions + (draftId to ChatSessionSnapshot()),
         )
+        hydrateDraftDefaults(draftId)
         return draftId
     }
 
@@ -1374,6 +1377,7 @@ class HermesConnectionViewModel(
             title = title,
             projectId = project.id,
             workspacePath = workspacePath,
+            profile = mutableSnapshots.value.selectedProfile,
             isLocalDraft = true,
         )
         pendingDraftSessions += draftId
@@ -1394,9 +1398,72 @@ class HermesConnectionViewModel(
             projectSessionStates = snapshot.projectSessionStates + (
                 projectId to ProjectSessionLoadState.Loaded(projectSessions)
                 ),
-            chatSessions = chatSessions,
+            chatSessions = chatSessions + (draftId to (chatSessions[draftId] ?: ChatSessionSnapshot())),
         )
+        hydrateDraftDefaults(draftId)
         return draftId
+    }
+
+    private fun hydrateDraftDefaults(durableSessionId: DurableSessionId) {
+        val origin = activeOrigin
+        val originGeneration = generation
+        val profile = localDraftSession(durableSessionId)?.profile
+            ?: mutableSnapshots.value.selectedProfile
+        viewModelScope.launch {
+            if (origin == null) {
+                updateChat(durableSessionId) { it.copy(draftDefaultsLoaded = true) }
+                return@launch
+            }
+            try {
+                val accessToken = accessTokenForRequest(origin, originGeneration)
+                    ?: throw HermesConnectionException("Sign in is required to load session defaults")
+                val options = client.loadDefaultModelOptions(origin, accessToken, profile)
+                val selection = options.current
+                val reasoningEffort = selection?.let {
+                    try {
+                        client.loadProfileReasoningEffort(
+                            serverOrigin = origin,
+                            accessToken = accessToken,
+                            profile = profile,
+                            provider = it.provider,
+                            model = it.model,
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (expired: NativeRefreshExpiredException) {
+                        throw expired
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                if (
+                    !isCurrentOrigin(origin, originGeneration) ||
+                    durableSessionId !in pendingDraftSessions
+                ) return@launch
+                updateChat(durableSessionId) { chat ->
+                    chat.copy(
+                        model = selection?.model,
+                        provider = selection?.provider,
+                        reasoningEffort = reasoningEffort,
+                        draftDefaultsLoaded = true,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: NativeRefreshExpiredException) {
+                if (isCurrentOrigin(origin, originGeneration)) {
+                    disconnectChat()
+                    publishSignInRequired()
+                }
+            } catch (_: Exception) {
+                if (
+                    isCurrentOrigin(origin, originGeneration) &&
+                    durableSessionId in pendingDraftSessions
+                ) {
+                    updateChat(durableSessionId) { it.copy(draftDefaultsLoaded = true) }
+                }
+            }
+        }
     }
 
     /**
@@ -2445,7 +2512,7 @@ class HermesConnectionViewModel(
             val resumed = if (durableSessionId in pendingDraftSessions) {
                 session.createSession(
                     durableSessionId = durableSessionId,
-                    profile = "default",
+                    profile = localDraftSession(durableSessionId)?.profile ?: "default",
                     workspacePath = localDraftSession(durableSessionId)
                         ?.workspacePath
                         ?.let(::validProjectWorkspacePath),
