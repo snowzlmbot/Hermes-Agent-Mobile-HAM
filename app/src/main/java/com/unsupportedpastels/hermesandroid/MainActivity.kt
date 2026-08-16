@@ -34,6 +34,7 @@ import com.unsupportedpastels.hermesandroid.gateway.UnsupportedBlockingKind
 import com.unsupportedpastels.hermesandroid.notifications.NotificationNavigationInbox
 import com.unsupportedpastels.hermesandroid.notifications.SessionNotificationVisibilityRegistry
 import com.unsupportedpastels.hermesandroid.notifications.synchronizeVisibleSessionNotifications
+import com.unsupportedpastels.hermesandroid.session.SavedSessionFilter
 import com.unsupportedpastels.hermesandroid.share.SharePayload
 import com.unsupportedpastels.hermesandroid.share.nextShareRequestId
 import com.unsupportedpastels.hermesandroid.share.parseIncomingShare
@@ -134,6 +135,7 @@ class MainActivity : ComponentActivity() {
                     onOpenSession = connectionViewModel::openSession,
                     onSendMessage = connectionViewModel::sendMessage,
                     onReasoningSelected = connectionViewModel::setReasoningEffort,
+                    onFastSelected = connectionViewModel::setFast,
                     onClarificationResponse = { sessionId, requestId, answer ->
                         connectionViewModel.respondToClarification(sessionId, requestId, answer)
                     },
@@ -202,6 +204,7 @@ internal fun HermesAppHost(
     onOpenSession: (DurableSessionId) -> Unit = {},
     onSendMessage: (DurableSessionId, String) -> Unit = { _, _ -> },
     onReasoningSelected: (DurableSessionId, String) -> Unit = { _, _ -> },
+    onFastSelected: (DurableSessionId, Boolean) -> Unit = { _, _ -> },
     onClarificationResponse: (DurableSessionId, String, String) -> Unit = { _, _, _ -> },
     onApprovalResponse: (DurableSessionId, String, Boolean) -> Unit = { _, _, _ -> },
     onBlockingResponse: (DurableSessionId, UnsupportedBlockingKind, String, String) -> Unit = { _, _, _, _ -> },
@@ -213,7 +216,9 @@ internal fun HermesAppHost(
             MutableStateFlow<ProjectIconAssignmentsState>(ProjectIconAssignmentsState.Loading)
         }
     val projectIconAssignments by projectIconAssignmentsFlow.collectAsStateWithLifecycle()
-    val currentServerOrigin = (serverSettingsState as? ServerSettingsState.Ready)?.serverOrigin
+    val currentServerOrigin = (serverSettingsState as? ServerSettingsState.Ready)?.activeOrigin
+    val currentServerCatalog = (serverSettingsState as? ServerSettingsState.Ready)?.catalog
+        ?: com.unsupportedpastels.hermesandroid.connection.ServerCatalog.empty()
     val projectIcons = (projectIconAssignments as? ProjectIconAssignmentsState.Ready)
         ?.assignments
         .orEmpty()
@@ -231,6 +236,9 @@ internal fun HermesAppHost(
     val homeRefreshingFlow = connectionViewModel?.homeRefreshing
         ?: remember { MutableStateFlow(false) }
     val homeRefreshing by homeRefreshingFlow.collectAsStateWithLifecycle()
+    val savedSessionFiltersFlow = connectionViewModel?.savedSessionFilters
+        ?: remember { MutableStateFlow(emptyList<SavedSessionFilter>()) }
+    val savedSessionFilters by savedSessionFiltersFlow.collectAsStateWithLifecycle()
     val persistedPaneProportionFlow = paneLayoutPreferencesViewModel?.projectSessionPaneProportion
         ?: remember { MutableStateFlow<Float?>(null) }
     val persistedPaneProportion by persistedPaneProportionFlow.collectAsStateWithLifecycle()
@@ -254,14 +262,26 @@ internal fun HermesAppHost(
         },
         onVisibleSessionChanged = onVisibleSessionChanged,
         serverSettingsState = serverSettingsState,
+        serverCatalog = currentServerCatalog,
         transcriptCachingEnabled = transcriptCachingEnabled,
         onTranscriptCachingChanged = onTranscriptCachingChanged,
         onClearOfflineCache = onClearOfflineCache,
         onSaveServerOrigin = { origin -> viewModel.save(origin).await() },
+        onSaveServerEntry = { entry -> viewModel.save(entry).await() },
+        onUpdateServerLabel = { entry -> viewModel.updateLabel(entry).await() },
+        onSelectServerOrigin = { origin -> viewModel.select(origin).await() },
+        onRemoveServerOrigin = { origin -> viewModel.remove(origin).await() },
         onLoadManagementSettings = { profile -> connectionViewModel?.loadManagementSettings(profile) },
+        onRefreshDurableSessions = { archivedOnly ->
+            connectionViewModel?.refreshDurableSessions(archivedOnly)
+        },
         onSetProfileDefaultModel = { selection, confirm ->
             connectionViewModel?.setProfileDefaultModel(selection, confirm)
                 ?: ModelSwitchResult(accepted = false)
+        },
+        onSetProfileReasoningEffort = { effort ->
+            connectionViewModel?.setProfileReasoningEffort(effort)
+                ?: Result.failure(IllegalStateException("Profile settings unavailable"))
         },
         onLogout = { connectionViewModel?.logout() },
         onSignIn = onSignIn,
@@ -286,6 +306,12 @@ internal fun HermesAppHost(
         onCronJobAction = { jobId, action ->
             connectionViewModel?.manageCronJob(jobId, action)
         },
+        onRunCronJob = { jobId ->
+            connectionViewModel?.triggerCronJob(jobId)
+        },
+        onToggleCronJobRuns = { jobId ->
+            connectionViewModel?.toggleCronJobRuns(jobId)
+        },
         isHomeRefreshing = homeRefreshing,
         onRefreshHome = { connectionViewModel?.refreshHomeData() },
         onRenameSession = { sessionId, title ->
@@ -304,9 +330,23 @@ internal fun HermesAppHost(
             connectionViewModel?.let { vm -> resultPreservingCancellation { vm.deleteSession(sessionId) } }
                 ?: Result.failure(IllegalStateException("Session management unavailable"))
         },
+        savedSessionFilters = savedSessionFilters,
+        onSaveSessionFilter = { filter ->
+            connectionViewModel?.let { vm -> resultPreservingCancellation { vm.saveSessionFilter(filter) } }
+                ?: Result.failure(IllegalStateException("Saved session filters unavailable"))
+        },
+        onRemoveSessionFilter = { name ->
+            connectionViewModel?.let { vm -> resultPreservingCancellation { vm.removeSessionFilter(name) } }
+                ?: Result.failure(IllegalStateException("Saved session filters unavailable"))
+        },
+        onBulkDeleteSessions = { sessionIds ->
+            connectionViewModel?.let { vm -> resultPreservingCancellation { vm.bulkDeleteSessions(sessionIds) } }
+                ?: Result.failure(IllegalStateException("Bulk session deletion unavailable"))
+        },
         onSearchTranscripts = { query -> connectionViewModel?.searchTranscripts(query) },
         onSendMessage = onSendMessage,
         onReasoningSelected = onReasoningSelected,
+        onFastSelected = onFastSelected,
         onClarificationResponse = onClarificationResponse,
         onApprovalResponse = onApprovalResponse,
         onBlockingResponse = onBlockingResponse,

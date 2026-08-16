@@ -15,7 +15,14 @@ import com.unsupportedpastels.hermesandroid.gateway.HermesChatSession
 import com.unsupportedpastels.hermesandroid.gateway.HermesChatTransportException
 import com.unsupportedpastels.hermesandroid.gateway.HostDirectoryEntry
 import com.unsupportedpastels.hermesandroid.gateway.HostDirectoryListing
+import com.unsupportedpastels.hermesandroid.gateway.OperationalStatus
+import com.unsupportedpastels.hermesandroid.gateway.OperationalStatusState
+import com.unsupportedpastels.hermesandroid.gateway.OperationalHealth
+import com.unsupportedpastels.hermesandroid.gateway.OperationalPressure
+import com.unsupportedpastels.hermesandroid.gateway.lastGoodOrNull
 import com.unsupportedpastels.hermesandroid.gateway.ModelOptions
+import com.unsupportedpastels.hermesandroid.gateway.CurrentModelInfo
+import com.unsupportedpastels.hermesandroid.gateway.ModelCapabilities
 import com.unsupportedpastels.hermesandroid.gateway.ModelProviderOption
 import com.unsupportedpastels.hermesandroid.gateway.ModelSelection
 import com.unsupportedpastels.hermesandroid.gateway.ModelSwitchResult
@@ -23,9 +30,14 @@ import com.unsupportedpastels.hermesandroid.gateway.PromptSubmission
 import com.unsupportedpastels.hermesandroid.app.ProjectSessionsResult
 import com.unsupportedpastels.hermesandroid.app.ProjectTreeResult
 import com.unsupportedpastels.hermesandroid.gateway.ResumedChatSession
+import com.unsupportedpastels.hermesandroid.gateway.RuntimeAccess
 import com.unsupportedpastels.hermesandroid.gateway.RuntimeSessionId
 import com.unsupportedpastels.hermesandroid.gateway.CronJob
 import com.unsupportedpastels.hermesandroid.gateway.CronJobAction
+import com.unsupportedpastels.hermesandroid.gateway.CronJobRun
+import com.unsupportedpastels.hermesandroid.gateway.CronJobRunsState
+import com.unsupportedpastels.hermesandroid.gateway.CronJobScope
+import com.unsupportedpastels.hermesandroid.gateway.CronRestCapability
 import com.unsupportedpastels.hermesandroid.gateway.CronJobsState
 import com.unsupportedpastels.hermesandroid.gateway.HermesChatProtocolException
 import com.unsupportedpastels.hermesandroid.app.DurableSessionId
@@ -36,6 +48,7 @@ import com.unsupportedpastels.hermesandroid.app.ProjectId
 import com.unsupportedpastels.hermesandroid.app.ProjectLoadState
 import com.unsupportedpastels.hermesandroid.app.ProjectSessionLoadState
 import com.unsupportedpastels.hermesandroid.app.ProjectSummary
+import com.unsupportedpastels.hermesandroid.app.ProcessRow
 import com.unsupportedpastels.hermesandroid.app.RunToolState
 import com.unsupportedpastels.hermesandroid.app.SessionSummary
 import androidx.lifecycle.ViewModelProvider
@@ -58,6 +71,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
@@ -168,6 +182,48 @@ class HermesConnectionViewModelTest {
         assertEquals(ConnectionState.Disconnected, viewModel.snapshots.value.connectionState)
         assertEquals(CacheSource.Cached, viewModel.snapshots.value.sessionMetadataSource)
         assertEquals(listOf(cached), viewModel.snapshots.value.durableSessions)
+    }
+
+    @Test
+    fun delayedOfflineCacheCannotReplaceLiveSessionsAfterSuccessfulFirstLaunch() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val cached = SessionSummary(DurableSessionId("cached-1"), "Cached session")
+        val live = SessionSummary(DurableSessionId("live-1"), "Live session")
+        val cacheReadBarrier = CompletableDeferred<Unit>()
+        val cache = RecordingOfflineCacheRepository(
+            snapshots = mapOf(
+                CacheScope(origin, "default") to OfflineCacheSnapshot(
+                    listOf(CachedSession(cached, updatedAtEpochSeconds = 10)),
+                ),
+            ),
+            readBarrier = cacheReadBarrier,
+        )
+        val client = FakeHermesConnectionClient()
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow(ServerSettingsState.Ready(origin)),
+            client = client,
+            cacheRepository = cache,
+            nowEpochSeconds = { 11 },
+        )
+        runCurrent()
+        client.response.complete(
+            HermesConnectionInfo(
+                version = "0.20.0",
+                authRequired = false,
+                nativeOAuthSupported = false,
+                providers = emptyList(),
+                sessions = listOf(live),
+            ),
+        )
+        runCurrent()
+        assertEquals(CacheSource.Live, viewModel.snapshots.value.sessionMetadataSource)
+        assertEquals(listOf(live), viewModel.snapshots.value.durableSessions)
+
+        cacheReadBarrier.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(CacheSource.Live, viewModel.snapshots.value.sessionMetadataSource)
+        assertEquals(listOf(live), viewModel.snapshots.value.durableSessions)
     }
 
     @Test
@@ -1305,6 +1361,202 @@ class HermesConnectionViewModelTest {
     }
 
     @Test
+    fun resumeOnFirstOpenPopulatesModelCapabilitiesSoReasoningIsEditable() = runTest(dispatcher) {
+        val settings = MutableStateFlow(
+            ServerSettingsState.Ready(ServerOrigin.parse("https://hermes.example")),
+        )
+        val durableId = DurableSessionId("stored-reasoning-capabilities")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            defaultModelOptions = ModelOptions(
+                current = ModelSelection("openai-codex", "gpt-5.6-sol"),
+                providers = listOf(
+                    ModelProviderOption(
+                        slug = "openai-codex",
+                        name = "Codex",
+                        models = listOf("gpt-5.6-sol"),
+                        capabilities = mapOf(
+                            "gpt-5.6-sol" to ModelCapabilities(reasoning = true, fast = true),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val chatSession = ReasoningResumeChatSession(durableId)
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(
+            AuthenticatedHermesConnection(
+                "user",
+                listOf(SessionSummary(durableId, "Reasoning capabilities session")),
+            ),
+        )
+        advanceUntilIdle()
+        viewModel.loadManagementSettings().join()
+        advanceUntilIdle()
+
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+
+        val chat = viewModel.snapshots.value.chatSessions.getValue(durableId)
+        assertEquals(ModelCapabilities(reasoning = true, fast = true), chat.modelCapabilities)
+    }
+
+    @Test
+    fun resumePopulatesCapabilitiesFromCurrentModelInfoForTheResumedModel() = runTest(dispatcher) {
+        val settings = MutableStateFlow(
+            ServerSettingsState.Ready(ServerOrigin.parse("https://hermes.example")),
+        )
+        val durableId = DurableSessionId("stored-current-info-capabilities")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            currentModelInfoLoader = { _, _, _ ->
+                CurrentModelInfo(
+                    profile = "default",
+                    model = "gpt-5.6-sol",
+                    provider = "openai-codex",
+                    effectiveContextLength = 8192,
+                    capabilities = ModelCapabilities(reasoning = true, fast = false),
+                )
+            }
+        }
+        val chatSession = ReasoningResumeChatSession(durableId)
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(
+            AuthenticatedHermesConnection(
+                "user",
+                listOf(SessionSummary(durableId, "Current model info capabilities")),
+            ),
+        )
+        advanceUntilIdle()
+        viewModel.loadManagementSettings().join()
+        advanceUntilIdle()
+
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+
+        val chat = viewModel.snapshots.value.chatSessions.getValue(durableId)
+        assertEquals(ModelCapabilities(reasoning = true, fast = false), chat.modelCapabilities)
+    }
+
+    @Test
+    fun resumeMatchesQualifiedRuntimeModelToCurrentModelCapabilities() = runTest(dispatcher) {
+        val settings = MutableStateFlow(
+            ServerSettingsState.Ready(ServerOrigin.parse("https://hermes.example")),
+        )
+        val durableId = DurableSessionId("stored-qualified-model-capabilities")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            currentModelInfoLoader = { _, _, _ ->
+                CurrentModelInfo(
+                    profile = "default",
+                    model = "gpt-5.6-sol",
+                    provider = "openai-codex",
+                    effectiveContextLength = 8192,
+                    capabilities = ModelCapabilities(reasoning = true, fast = true),
+                )
+            }
+        }
+        val chatSession = ReasoningResumeChatSession(
+            durableSessionId = durableId,
+            model = "openai/gpt-5.6-sol",
+        )
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(
+            AuthenticatedHermesConnection(
+                "user",
+                listOf(SessionSummary(durableId, "Qualified model capabilities")),
+            ),
+        )
+        advanceUntilIdle()
+        viewModel.loadManagementSettings().join()
+        advanceUntilIdle()
+
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+
+        val chat = viewModel.snapshots.value.chatSessions.getValue(durableId)
+        assertEquals(ModelCapabilities(reasoning = true, fast = true), chat.modelCapabilities)
+    }
+
+    @Test
+    fun resumeFallsBackToModelOptionsWhenCurrentInfoHasNoExplicitCapabilities() = runTest(dispatcher) {
+        val settings = MutableStateFlow(
+            ServerSettingsState.Ready(ServerOrigin.parse("https://hermes.example")),
+        )
+        val durableId = DurableSessionId("stored-options-capabilities")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            currentModelInfoLoader = { _, _, _ ->
+                CurrentModelInfo(
+                    profile = "default",
+                    model = "gpt-5.6-sol",
+                    provider = "openai-codex",
+                    effectiveContextLength = 8192,
+                    capabilities = ModelCapabilities(),
+                )
+            }
+            defaultModelOptions = ModelOptions(
+                current = ModelSelection("openai-codex", "gpt-5.6-sol"),
+                providers = listOf(
+                    ModelProviderOption(
+                        slug = "openai-codex",
+                        name = "Codex",
+                        models = listOf("gpt-5.6-sol"),
+                        capabilities = mapOf(
+                            "gpt-5.6-sol" to ModelCapabilities(reasoning = true, fast = true),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val chatSession = ReasoningResumeChatSession(durableId)
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(
+            AuthenticatedHermesConnection(
+                "user",
+                listOf(SessionSummary(durableId, "Options capabilities")),
+            ),
+        )
+        advanceUntilIdle()
+        viewModel.loadManagementSettings().join()
+        advanceUntilIdle()
+
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+
+        val chat = viewModel.snapshots.value.chatSessions.getValue(durableId)
+        assertEquals(ModelCapabilities(reasoning = true, fast = true), chat.modelCapabilities)
+    }
+
+    @Test
     fun modelPickerCreatesDraftRuntimeAndAppliesOnlyAdvertisedSessionSelection() = runTest(dispatcher) {
         val origin = ServerOrigin.parse("https://hermes.example")
         val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
@@ -1339,6 +1591,205 @@ class HermesConnectionViewModelTest {
         assertEquals(ModelSelection("nous", "gpt-5.6-luna"), chatSession.appliedSelection)
         assertEquals(RuntimeSessionId("runtime-model"), chatSession.appliedRuntimeId)
         assertEquals(false, chatSession.confirmExpensive)
+    }
+
+    @Test
+    fun fastSelectionRequiresAdvertisedCapabilityAndExactRuntimeIdentity() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val client = AuthenticatingHermesConnectionClient()
+        val chatSession = ModelPickerChatSession()
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin)),
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+        val draftId = viewModel.createNewSession()
+        viewModel.openModelPicker(draftId)
+        advanceUntilIdle()
+
+        viewModel.setFast(draftId, fast = true)
+        advanceUntilIdle()
+
+        assertEquals(RuntimeSessionId("runtime-model"), chatSession.fastRuntimeId)
+        assertEquals(true, chatSession.appliedFast)
+        assertEquals("fast", viewModel.snapshots.value.chatSessions.getValue(draftId).fastMode)
+    }
+
+    @Test
+    fun fastSelectionLazilyAttachesAnAdvertisedDurableSession() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val durableId = DurableSessionId("stored-lazy-fast")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            currentModelInfoLoader = { _, _, _ ->
+                CurrentModelInfo(
+                    profile = "default",
+                    model = "gpt-5.6-sol",
+                    provider = "openai-codex",
+                    effectiveContextLength = 8192,
+                    capabilities = ModelCapabilities(reasoning = true, fast = true),
+                )
+            }
+        }
+        val chatSession = ReasoningResumeChatSession(durableId)
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin)),
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(
+            AuthenticatedHermesConnection(
+                "user",
+                listOf(SessionSummary(durableId, "Lazy Fast session")),
+            ),
+        )
+        advanceUntilIdle()
+        viewModel.loadManagementSettings().join()
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+
+        viewModel.setFast(durableId, fast = true)
+        advanceUntilIdle()
+
+        assertEquals(2, chatSession.resumeCalls)
+        assertEquals(RuntimeSessionId("runtime-reasoning"), chatSession.fastRuntimeId)
+        assertEquals(true, chatSession.appliedFast)
+        assertEquals("fast", viewModel.snapshots.value.chatSessions.getValue(durableId).fastMode)
+    }
+
+    @Test
+    fun fastSelectionIsIgnoredWhenRuntimeIdentityIsNoLongerCurrent() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val client = AuthenticatingHermesConnectionClient()
+        val chatSession = ModelPickerChatSession()
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin)),
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+        val draftId = viewModel.createNewSession()
+        viewModel.openModelPicker(draftId)
+        advanceUntilIdle()
+        viewModel.logout()
+        advanceUntilIdle()
+
+        viewModel.setFast(draftId, fast = true)
+        advanceUntilIdle()
+
+        assertEquals(null, chatSession.fastRuntimeId)
+    }
+
+    @Test
+    fun draftFastSetupFailurePreservesCreatedRuntimeAndRetryReusesIt() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            defaultModelOptions = ModelOptions(
+                current = ModelSelection("nous", "fast-model"),
+                providers = listOf(
+                    ModelProviderOption(
+                        "nous",
+                        "Nous Research",
+                        listOf("fast-model"),
+                        capabilities = mapOf("fast-model" to ModelCapabilities(fast = true, reasoning = true)),
+                    ),
+                ),
+            )
+        }
+        val chatSession = FastFailureDraftChatSession()
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+            projectConnector = null,
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+
+        val draftId = viewModel.createNewSession()
+        advanceUntilIdle()
+        viewModel.setFast(draftId, fast = true)
+        advanceUntilIdle()
+
+        viewModel.sendMessage(draftId, "Run the task")
+        advanceUntilIdle()
+
+        // The transient Fast RPC failure must not orphan the created runtime:
+        // the controller is still published and the prompt still submits.
+        assertEquals(1, chatSession.createCalls)
+        assertEquals(1, chatSession.setFastCalls)
+        assertEquals(1, chatSession.submitCalls)
+        assertFalse(chatSession.closed)
+        assertTrue(
+            viewModel.snapshots.value.activeRuntimes.any {
+                it.durableSessionId == draftId && it.access == RuntimeAccess.Controller
+            },
+        )
+        assertEquals(null, viewModel.snapshots.value.chatSessions.getValue(draftId).error)
+
+        // A retry resumes the same runtime instead of creating a second orphan.
+        viewModel.sendMessage(draftId, "Keep going")
+        advanceUntilIdle()
+        assertEquals(1, chatSession.createCalls)
+        assertEquals(2, chatSession.submitCalls)
+    }
+
+    @Test
+    fun promptStartRefreshesProcessRowsFromTheLaunchedTurn() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        }
+        val chatSession = ProcessAwareDraftChatSession()
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            chatConnector = HermesChatConnector { _, _ -> chatSession },
+            projectConnector = null,
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+
+        val draftId = viewModel.createNewSession()
+        advanceUntilIdle()
+
+        viewModel.sendMessage(draftId, "Launch the build")
+        advanceUntilIdle()
+
+        // The process row only exists after the prompt was accepted, so the
+        // post-submit refresh must be the one that populates the activity stack.
+        assertEquals(1, chatSession.submitCalls)
+        assertTrue(chatSession.processListCalls >= 2)
+        val rows = viewModel.snapshots.value.chatSessions.getValue(draftId).processRows
+        assertEquals(listOf("proc-1"), rows.map { it.processId })
+        assertEquals("running", rows.single().status)
     }
 
     @Test
@@ -1595,7 +2046,7 @@ class HermesConnectionViewModelTest {
     }
 
     @Test
-    fun refreshHomeDataReloadsAuthenticationAndTreeAndTogglesRefreshing() = runTest(dispatcher) {
+    fun refreshHomeDataReloadsSelectedProfileSessionsAndTreeAndTogglesRefreshing() = runTest(dispatcher) {
         val origin = ServerOrigin.parse("https://hermes.example")
         val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
         val projectId = ProjectId("project-1")
@@ -1646,7 +2097,11 @@ class HermesConnectionViewModelTest {
         advanceUntilIdle()
         refreshJob.join()
 
-        assertEquals(2, client.authenticateCalls)
+        // The Home refresh reloads the selected profile's rows through the
+        // profile-scoped contract instead of re-authenticating the default profile.
+        assertEquals(1, client.authenticateCalls)
+        assertEquals(2, client.sessionsForProfileRequests.size)
+        assertEquals("default", client.sessionsForProfileRequests.last().profile)
         assertEquals(2, treeLoads)
         assertFalse(viewModel.homeRefreshing.value)
         assertEquals(ProjectLoadState.Loaded(tree.projects), viewModel.snapshots.value.projectState)
@@ -1759,6 +2214,87 @@ class HermesConnectionViewModelTest {
 
         assertEquals(null, viewModel.snapshots.value.cronJobActionJobId)
         assertEquals("Could not enable the job", viewModel.snapshots.value.cronJobActionError)
+    }
+
+    @Test
+    fun cronRestActionsAreCapabilityGatedScopedAndPerJobLoadingIsIdempotent() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val scope = CronJobScope(origin.value, "work", "job-1")
+        val jobs = listOf(CronJob("job-1", "Daily brief", "0 8 * * *", enabled = true))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            profiles = listOf("work")
+            cronTriggerResponse = CompletableDeferred()
+            cronRunsResponse = listOf(
+                CronJobRun("run-1", title = "Returned run", preview = "A returned preview"),
+            )
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow(ServerSettingsState.Ready(origin)),
+            client = client,
+            tokenStore = FixedTokenStore(),
+            projectConnector = null,
+        )
+
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+
+        viewModel.loadManagementSettings("work").join()
+        viewModel.triggerCronJob("job-1")
+        viewModel.triggerCronJob("job-1")
+        runCurrent()
+        assertEquals(setOf(scope), viewModel.snapshots.value.cronRunLoadingScopes)
+        assertEquals(1, client.cronTriggerCalls)
+
+        client.cronTriggerResponse!!.complete(jobs.single())
+        advanceUntilIdle()
+        assertEquals(1, client.cronTriggerCalls)
+        assertEquals(CronRestCapability.Supported, viewModel.snapshots.value.cronTriggerCapability)
+
+        client.cronTriggerFailure = HermesCronJobClaimedException("job-2")
+        viewModel.triggerCronJob("job-2").join()
+        assertEquals(
+            "Cron job is already running or was claimed by another scheduler",
+            viewModel.snapshots.value.cronRunErrors[scope.copy(jobId = "job-2")],
+        )
+
+        viewModel.toggleCronJobRuns("job-1").join()
+        assertEquals(
+            CronJobRunsState.Ready(client.cronRunsResponse),
+            viewModel.snapshots.value.cronRunsByScope[scope],
+        )
+        assertEquals(listOf(scope), client.cronRunsScopes)
+    }
+
+    @Test
+    fun cronRestUnsupportedAndClaimedResponsesDoNotBecomeGenericFailures() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val client = AuthenticatingHermesConnectionClient().apply {
+            cronTriggerFailure = HermesCronRestUnsupportedException(CronRestEndpoint.Trigger, 404)
+            cronRunsFailure = HermesCronRestUnsupportedException(CronRestEndpoint.Runs, 405)
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = MutableStateFlow(ServerSettingsState.Ready(origin)),
+            client = client,
+            tokenStore = FixedTokenStore(),
+            projectConnector = null,
+        )
+        runCurrent()
+        client.probeResponse.complete(authRequiredInfo())
+        runCurrent()
+        client.authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+        advanceUntilIdle()
+
+        viewModel.triggerCronJob("job-1").join()
+        viewModel.toggleCronJobRuns("job-1").join()
+
+        assertEquals(CronRestCapability.Unsupported, viewModel.snapshots.value.cronTriggerCapability)
+        assertEquals(CronRestCapability.Unsupported, viewModel.snapshots.value.cronHistoryCapability)
+        assertTrue(viewModel.snapshots.value.cronRunErrors.isEmpty())
+        assertTrue(viewModel.snapshots.value.cronRunsByScope.values.all { it is CronJobRunsState.Unsupported })
+
     }
 
     @Test
@@ -2124,6 +2660,51 @@ class HermesConnectionViewModelTest {
     }
 
     @Test
+    fun originSwitchClearsOldOriginSnapshotBeforeNewProbeCompletes() = runTest(dispatcher) {
+        val originA = ServerOrigin.parse("https://a.example")
+        val originB = ServerOrigin.parse("https://b.example")
+        val oldSession = SessionSummary(DurableSessionId("old"), "Old origin")
+        val newSession = SessionSummary(DurableSessionId("new"), "New origin")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(originA))
+        val client = SwitchingHermesConnectionClient()
+        val viewModel = HermesConnectionViewModel(settings, client)
+
+        runCurrent()
+        client.probes.getValue(originA).complete(
+            HermesConnectionInfo(
+                version = "a",
+                authRequired = false,
+                nativeOAuthSupported = false,
+                providers = emptyList(),
+                sessions = listOf(oldSession),
+            ),
+        )
+        advanceUntilIdle()
+        assertEquals(listOf(oldSession), viewModel.snapshots.value.durableSessions)
+
+        settings.value = ServerSettingsState.Ready(originB)
+        runCurrent()
+        assertTrue(viewModel.snapshots.value.durableSessions.isEmpty())
+        assertTrue(viewModel.snapshots.value.projects.isEmpty())
+        assertTrue(viewModel.snapshots.value.chatSessions.isEmpty())
+        assertTrue(viewModel.snapshots.value.activeRuntimes.isEmpty())
+        assertEquals(ModelPickerState.Closed, viewModel.modelPickerState.value)
+
+        client.probes.getValue(originB).complete(
+            HermesConnectionInfo(
+                version = "b",
+                authRequired = false,
+                nativeOAuthSupported = false,
+                providers = emptyList(),
+                sessions = listOf(newSession),
+            ),
+        )
+        advanceUntilIdle()
+        assertEquals(listOf(newSession), viewModel.snapshots.value.durableSessions)
+        assertTrue(viewModel.snapshots.value.durableSessions.none { it.id == oldSession.id })
+    }
+
+    @Test
     fun originChangeCancelsSignInAndRejectsLateOldOriginTokens() = runTest(dispatcher) {
         val originA = ServerOrigin.parse("https://a.example")
         val originB = ServerOrigin.parse("https://b.example")
@@ -2158,6 +2739,339 @@ class HermesConnectionViewModelTest {
     }
 
     @Test
+    fun savedFiltersReloadOnlyForCurrentOriginAndProfile() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            profiles = listOf("default", "work")
+        }
+        val repository = RecordingSessionFilterRepository()
+        repository.save(
+            com.unsupportedpastels.hermesandroid.session.SessionFilterScope(origin, "work"),
+            com.unsupportedpastels.hermesandroid.session.SavedSessionFilter(
+                "Work",
+                com.unsupportedpastels.hermesandroid.session.SessionListFilter(query = "todo"),
+            ),
+        )
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            sessionFilterRepository = repository,
+        )
+        advanceUntilIdle()
+
+        assertTrue(viewModel.savedSessionFilters.value.isEmpty())
+        viewModel.loadManagementSettings("work").join()
+        assertEquals("Work", viewModel.savedSessionFilters.value.single().name)
+        viewModel.loadManagementSettings("default").join()
+        assertTrue(viewModel.savedSessionFilters.value.isEmpty())
+
+        val otherOrigin = ServerOrigin.parse("https://other.example")
+        settings.value = ServerSettingsState.Ready(otherOrigin)
+        runCurrent()
+        assertTrue(viewModel.savedSessionFilters.value.isEmpty())
+    }
+
+    @Test
+    fun loadManagementSettingsAtomicallyPublishesSelectedProfileSessions() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val defaultSessions = listOf(SessionSummary(DurableSessionId("stored-default"), "Default row"))
+        val workSessions = listOf(SessionSummary(DurableSessionId("stored-work"), "Work row"))
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", defaultSessions))
+            profiles = listOf("default", "work")
+            sessionsForProfileLoader = { _, _, profile, _ ->
+                if (profile == "work") workSessions else defaultSessions
+            }
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+        assertEquals(defaultSessions, viewModel.snapshots.value.durableSessions)
+
+        viewModel.loadManagementSettings("work").join()
+
+        assertEquals("work", viewModel.snapshots.value.selectedProfile)
+        // Bulk-delete validation must never see the previous profile's rows.
+        assertEquals(workSessions, viewModel.snapshots.value.durableSessions)
+        assertEquals("work", client.sessionsForProfileRequests.last().profile)
+    }
+
+    @Test
+    fun archivedOnlyFilterFetchesArchivedRowsAndClearingRestoresExcludeListing() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val archivedRow = SessionSummary(DurableSessionId("stored-archived"), "Archived", archived = true)
+        val activeRow = SessionSummary(DurableSessionId("stored-active"), "Active")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", listOf(activeRow)))
+            sessionsForProfileLoader = { _, _, _, archivedOnly ->
+                if (archivedOnly) listOf(archivedRow) else listOf(activeRow)
+            }
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+
+        viewModel.refreshDurableSessions(archivedOnly = true).join()
+        assertEquals(listOf(archivedRow), viewModel.snapshots.value.durableSessions)
+        assertEquals(true, client.sessionsForProfileRequests.last().archivedOnly)
+
+        viewModel.refreshDurableSessions(archivedOnly = false).join()
+        assertEquals(listOf(activeRow), viewModel.snapshots.value.durableSessions)
+        assertEquals(false, client.sessionsForProfileRequests.last().archivedOnly)
+    }
+
+    @Test
+    fun homeRefreshKeepsArchivedRowsWhileArchivedFilterIsActive() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val archivedRow = SessionSummary(DurableSessionId("stored-archived"), "Archived", archived = true)
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            sessionsForProfileLoader = { _, _, _, archivedOnly ->
+                if (archivedOnly) listOf(archivedRow) else emptyList()
+            }
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+
+        viewModel.refreshDurableSessions(archivedOnly = true).join()
+        assertEquals(listOf(archivedRow), viewModel.snapshots.value.durableSessions)
+
+        // A pull-to-refresh while the archived filter is active must not clobber
+        // the archived rows with an exclude listing.
+        viewModel.refreshHomeData().join()
+        assertEquals(listOf(archivedRow), viewModel.snapshots.value.durableSessions)
+        assertEquals(true, client.sessionsForProfileRequests.last().archivedOnly)
+    }
+
+    @Test
+    fun bulkDeleteRefreshesDurableRowsOnlyAfterAuthoritativeSuccess() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val first = SessionSummary(DurableSessionId("stored-1"), "One")
+        val second = SessionSummary(DurableSessionId("stored-2"), "Two")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", listOf(first, second)))
+            bulkDeleteResponse = CompletableDeferred(BulkDeleteResult(ok = true, deleted = 1))
+            bulkSessionsAfterDelete = listOf(second)
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+
+        val result = viewModel.bulkDeleteSessions(listOf(first.id))
+
+        assertEquals(1, result.deleted)
+        assertEquals(listOf(first.id), client.bulkDeletedIds)
+        assertEquals(listOf(second), viewModel.snapshots.value.durableSessions)
+    }
+
+    @Test
+    fun bulkDeleteDoesNotPublishStaleCompletionAfterOriginSwitch() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val otherOrigin = ServerOrigin.parse("https://other.example")
+        val first = SessionSummary(DurableSessionId("stored-1"), "One")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", listOf(first)))
+            bulkDeleteResponse = CompletableDeferred()
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+
+        val deletion = async(kotlinx.coroutines.SupervisorJob()) {
+            runCatching { viewModel.bulkDeleteSessions(listOf(first.id)) }
+        }
+        runCurrent()
+        settings.value = ServerSettingsState.Ready(otherOrigin)
+        runCurrent()
+        client.bulkDeleteResponse.complete(BulkDeleteResult(ok = true, deleted = 1))
+        val deletionResult = deletion.await()
+        advanceUntilIdle()
+
+        assertTrue(deletionResult.isFailure)
+        assertEquals(otherOrigin, client.probedOrigins.last())
+    }
+
+    @Test
+    fun operationalStatusUsesSixtySecondCadenceAndPreservesLastGoodSnapshotOnTransientFailure() = runTest(dispatcher) {
+        var now = 1_900_000_000L
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            statusResponse = operationalStatus("default", "0.20.1")
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            nowEpochSeconds = { now },
+        )
+        advanceUntilIdle()
+        assertEquals(listOf("default"), client.operationalStatusProfiles)
+
+        viewModel.refreshOperationalStatus().join()
+        assertEquals(1, client.operationalStatusProfiles.size)
+        now += 60
+        viewModel.refreshOperationalStatus().join()
+        assertEquals(2, client.operationalStatusProfiles.size)
+
+        client.operationalStatusFailure = HermesConnectionException("temporary")
+        now += 60
+        viewModel.refreshOperationalStatus(force = true).join()
+        val state = viewModel.snapshots.value.operationalStatusState
+        assertTrue(state is OperationalStatusState.TransientError)
+        assertEquals("0.20.1", checkNotNull(state.lastGoodOrNull()).status.version)
+    }
+
+    @Test
+    fun operationalStatusSchedulesNextFetchAfterSixtySecondsWithoutExplicitCall() = runTest(dispatcher) {
+        var now = 1_900_000_000L
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val client = AuthenticatingHermesConnectionClient().apply {
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            statusResponse = operationalStatus("default", "0.20.1")
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+            nowEpochSeconds = { now },
+        )
+        advanceUntilIdle()
+        assertEquals(1, client.operationalStatusProfiles.size)
+
+        // Establish a fresh fetch whose completed tick owns the next cadence;
+        // the initial connect's tick was already consumed during advanceUntilIdle.
+        viewModel.refreshOperationalStatus(force = true).join()
+        assertEquals(2, client.operationalStatusProfiles.size)
+
+        // Once the 60-second window passes, the tick scheduled by the completed
+        // fetch refreshes the status without any explicit caller.
+        now += 60
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals(3, client.operationalStatusProfiles.size)
+        assertTrue(viewModel.snapshots.value.operationalStatusState is OperationalStatusState.Ready)
+    }
+
+    @Test
+    fun lateDefaultProfileStatusCannotReplaceSelectedProfileStatus() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val defaultStatus = CompletableDeferred<Unit>()
+        val workStatus = CompletableDeferred<Unit>()
+        val client = AuthenticatingHermesConnectionClient().apply {
+            profiles = listOf("default", "work")
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            operationalStatusLoader = { _, profile ->
+                operationalStatusProfiles += profile
+                when (profile) {
+                    "default" -> defaultStatus.await()
+                    "work" -> workStatus.await()
+                }
+                operationalStatus(profile, profile)
+            }
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        runCurrent()
+        viewModel.loadManagementSettings("work")
+        runCurrent()
+        defaultStatus.complete(Unit)
+        advanceUntilIdle()
+        assertEquals("work", viewModel.snapshots.value.selectedProfile)
+        assertTrue(viewModel.snapshots.value.operationalStatusState !is OperationalStatusState.Ready)
+
+        workStatus.complete(Unit)
+        advanceUntilIdle()
+        val ready = viewModel.snapshots.value.operationalStatusState
+        assertTrue(ready is OperationalStatusState.Ready)
+        assertEquals("work", checkNotNull(ready.lastGoodOrNull()).profile)
+    }
+    @Test
+    fun lateCurrentModelInfoCannotReplaceSelectedProfileMetadata() = runTest(dispatcher) {
+        val origin = ServerOrigin.parse("https://hermes.example")
+        val settings = MutableStateFlow<ServerSettingsState>(ServerSettingsState.Ready(origin))
+        val defaultInfo = CompletableDeferred<CurrentModelInfo>()
+        val client = AuthenticatingHermesConnectionClient().apply {
+            profiles = listOf("default", "work")
+            probeResponse.complete(authRequiredInfo())
+            authenticationResponse.complete(AuthenticatedHermesConnection("user", emptyList()))
+            currentModelInfoLoader = { _, _, profile ->
+                if (profile == "default") defaultInfo.await()
+                else CurrentModelInfo(
+                    profile = "work",
+                    model = "work-model",
+                    provider = "work-provider",
+                    effectiveContextLength = 65536,
+                    capabilities = ModelCapabilities(reasoning = true),
+                )
+            }
+        }
+        val viewModel = HermesConnectionViewModel(
+            settingsStates = settings,
+            client = client,
+            tokenStore = FixedTokenStore(),
+        )
+        advanceUntilIdle()
+
+        viewModel.loadManagementSettings("default")
+        runCurrent()
+        viewModel.loadManagementSettings("work").join()
+        defaultInfo.complete(
+            CurrentModelInfo(
+                profile = "default",
+                model = "default-model",
+                provider = "default-provider",
+                effectiveContextLength = 4096,
+                capabilities = ModelCapabilities(fast = true),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals("work", viewModel.snapshots.value.selectedProfile)
+        assertEquals("work-model", viewModel.snapshots.value.currentModelInfo?.model)
+        assertEquals("work", viewModel.snapshots.value.currentModelInfo?.profile)
+    }
+
+    @Test
     fun clearingViewModelClosesOwnedNetworkResources() {
         var closed = false
         val store = ViewModelStore()
@@ -2179,6 +3093,14 @@ class HermesConnectionViewModelTest {
     }
 }
 
+private fun operationalStatus(profile: String, version: String) = OperationalStatus(
+    profile = profile,
+    version = version,
+    overall = OperationalHealth.Ok,
+    memoryPressure = OperationalPressure.Ok,
+    diskPressure = OperationalPressure.Ok,
+)
+
 private fun authRequiredInfo() = HermesConnectionInfo(
     version = "0.20.0",
     authRequired = true,
@@ -2198,13 +3120,16 @@ private class FakeHermesConnectionClient : HermesConnectionClient {
 
 private class RecordingOfflineCacheRepository(
     private val snapshots: Map<CacheScope, OfflineCacheSnapshot> = emptyMap(),
+    private val readBarrier: CompletableDeferred<Unit>? = null,
 ) : OfflineCacheRepository {
     override val transcriptCachingEnabled = MutableStateFlow(false)
     val clearedScopes = mutableListOf<CacheScope?>()
     val clearedTranscriptScopes = mutableListOf<CacheScope?>()
 
-    override suspend fun read(scope: CacheScope, nowEpochSeconds: Long): OfflineCacheSnapshot =
-        snapshots[scope] ?: OfflineCacheSnapshot()
+    override suspend fun read(scope: CacheScope, nowEpochSeconds: Long): OfflineCacheSnapshot {
+        readBarrier?.await()
+        return snapshots[scope] ?: OfflineCacheSnapshot()
+    }
 
     override suspend fun writeMetadata(
         scope: CacheScope,
@@ -2234,6 +3159,12 @@ private class RecordingOfflineCacheRepository(
     }
 }
 
+private data class SessionProfileRequest(
+    val origin: String,
+    val profile: String,
+    val archivedOnly: Boolean,
+)
+
 private class AuthenticatingHermesConnectionClient : HermesConnectionClient {
     val probeResponse = CompletableDeferred<HermesConnectionInfo>()
     val authenticationResponse = CompletableDeferred<AuthenticatedHermesConnection>()
@@ -2248,9 +3179,68 @@ private class AuthenticatingHermesConnectionClient : HermesConnectionClient {
     val defaultModelProfiles = mutableListOf<String>()
     var profileReasoningEffort: String? = null
     var profileReasoningFailure: Throwable? = null
+    var currentModelInfoLoader: suspend (ServerOrigin, String, String) -> CurrentModelInfo = { _, _, profile ->
+        throw UnsupportedOperationException("current model info not configured for $profile")
+    }
+    var cronTriggerResponse: CompletableDeferred<CronJob>? = null
+    var cronTriggerFailure: Throwable? = null
+    var cronTriggerCalls = 0
+    var cronRunsResponse: List<CronJobRun> = emptyList()
+    var cronRunsFailure: Throwable? = null
+    val cronRunsScopes = mutableListOf<CronJobScope>()
+    var bulkDeleteResponse: CompletableDeferred<BulkDeleteResult> =
+        CompletableDeferred(BulkDeleteResult(ok = true, deleted = 0))
+    var bulkSessionsAfterDelete: List<SessionSummary>? = null
+    val bulkDeletedIds = mutableListOf<DurableSessionId>()
+    val probedOrigins = mutableListOf<ServerOrigin>()
+    val operationalStatusProfiles = mutableListOf<String>()
+    var statusResponse = operationalStatus("default", "0.20.0")
+    var operationalStatusFailure: Throwable? = null
+    var operationalStatusLoader: suspend (ServerOrigin, String) -> OperationalStatus = { _, profile ->
+        operationalStatusFailure?.let { throw it }
+        operationalStatusProfiles += profile
+        operationalStatus(profile, statusResponse.version ?: "0.20.0")
+    }
+    val sessionsForProfileRequests = mutableListOf<SessionProfileRequest>()
+    var sessionsForProfileFailure: Throwable? = null
+    var sessionsForProfileLoader: suspend (ServerOrigin, String, String, Boolean) -> List<SessionSummary> =
+        { _, _, _, _ ->
+            authenticatedSessionsOverride?.let { return@let it }
+                ?: authenticationResponse.await().sessions
+        }
 
-    override suspend fun probe(serverOrigin: ServerOrigin): HermesConnectionInfo =
-        probeResponse.await()
+    override suspend fun loadSessionsForProfile(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+        archivedOnly: Boolean,
+    ): List<SessionSummary> {
+        sessionsForProfileRequests += SessionProfileRequest(serverOrigin.value, profile, archivedOnly)
+        sessionsForProfileFailure?.let { throw it }
+        authenticateBarriers.firstOrNull()?.let { it.await() }
+        return sessionsForProfileLoader(serverOrigin, accessToken, profile, archivedOnly)
+    }
+
+    override suspend fun probe(serverOrigin: ServerOrigin): HermesConnectionInfo {
+        probedOrigins += serverOrigin
+        return probeResponse.await()
+    }
+
+    override suspend fun loadOperationalStatus(
+        serverOrigin: ServerOrigin,
+        profile: String,
+    ): OperationalStatus = operationalStatusLoader(serverOrigin, profile)
+
+    override suspend fun bulkDeleteSessions(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        durableSessionIds: Collection<DurableSessionId>,
+        profile: String?,
+    ): BulkDeleteResult {
+        bulkDeletedIds += durableSessionIds
+        bulkSessionsAfterDelete?.let { authenticatedSessionsOverride = it }
+        return bulkDeleteResponse.await()
+    }
 
     override suspend fun authenticate(
         serverOrigin: ServerOrigin,
@@ -2286,6 +3276,12 @@ private class AuthenticatingHermesConnectionClient : HermesConnectionClient {
         accessToken: String,
     ): List<String> = profiles
 
+    override suspend fun loadCurrentModelInfo(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+    ): CurrentModelInfo = currentModelInfoLoader(serverOrigin, accessToken, profile)
+
     override suspend fun loadProfileReasoningEffort(
         serverOrigin: ServerOrigin,
         accessToken: String,
@@ -2302,6 +3298,58 @@ private class AuthenticatingHermesConnectionClient : HermesConnectionClient {
         accessToken: String?,
         durableSessionId: DurableSessionId,
     ): List<com.unsupportedpastels.hermesandroid.gateway.ChatMessage> = emptyList()
+
+    override suspend fun triggerCronJob(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+        jobId: String,
+    ): CronJob {
+        cronTriggerCalls += 1
+        cronTriggerFailure?.let { throw it }
+        return cronTriggerResponse?.await() ?: CronJob(jobId, "Job", "every 1h")
+    }
+
+    override suspend fun loadCronJobRuns(
+        serverOrigin: ServerOrigin,
+        accessToken: String,
+        profile: String,
+        jobId: String,
+        limit: Int,
+    ): List<CronJobRun> {
+        cronRunsScopes += CronJobScope(serverOrigin.value, profile, jobId)
+        cronRunsFailure?.let { throw it }
+        return cronRunsResponse
+    }
+}
+
+private class RecordingSessionFilterRepository :
+    com.unsupportedpastels.hermesandroid.session.SessionFilterRepository {
+    private val values = mutableMapOf<
+        com.unsupportedpastels.hermesandroid.session.SessionFilterScope,
+        MutableList<com.unsupportedpastels.hermesandroid.session.SavedSessionFilter>,
+    >()
+
+    override suspend fun list(
+        scope: com.unsupportedpastels.hermesandroid.session.SessionFilterScope,
+    ): List<com.unsupportedpastels.hermesandroid.session.SavedSessionFilter> =
+        values[scope].orEmpty().toList()
+
+    override suspend fun save(
+        scope: com.unsupportedpastels.hermesandroid.session.SessionFilterScope,
+        filter: com.unsupportedpastels.hermesandroid.session.SavedSessionFilter,
+    ) {
+        val filters = values.getOrPut(scope) { mutableListOf() }
+        filters.removeAll { it.normalizedName == filter.normalizedName }
+        filters += filter
+    }
+
+    override suspend fun remove(
+        scope: com.unsupportedpastels.hermesandroid.session.SessionFilterScope,
+        name: String,
+    ) {
+        values[scope]?.removeAll { it.normalizedName == name.trim() }
+    }
 }
 
 private class FakeNativeLogin : NativeLogin {
@@ -2476,6 +3524,8 @@ private class ModelPickerChatSession(
     var appliedSelection: ModelSelection? = null
     var confirmExpensive = false
     var applyCalls = 0
+    var fastRuntimeId: RuntimeSessionId? = null
+    var appliedFast: Boolean? = null
 
     override suspend fun resume(
         durableSessionId: DurableSessionId,
@@ -2503,7 +3553,15 @@ private class ModelPickerChatSession(
         return ModelOptions(
             current = ModelSelection("nous", "current"),
             providers = listOf(
-                ModelProviderOption("nous", "Nous Research", listOf("current", "gpt-5.6-luna")),
+                ModelProviderOption(
+                    "nous",
+                    "Nous Research",
+                    listOf("current", "gpt-5.6-luna"),
+                    capabilities = mapOf(
+                        "current" to ModelCapabilities(fast = true, reasoning = true),
+                        "gpt-5.6-luna" to ModelCapabilities(fast = true, reasoning = true),
+                    ),
+                ),
             ),
         )
     }
@@ -2529,12 +3587,112 @@ private class ModelPickerChatSession(
         }
     }
 
+    override suspend fun setFast(runtimeSessionId: RuntimeSessionId, fast: Boolean) {
+        fastRuntimeId = runtimeSessionId
+        appliedFast = fast
+    }
+
     override suspend fun submitPrompt(
         runtimeSessionId: RuntimeSessionId,
         text: String,
     ): PromptSubmission = error("picker must not submit a prompt")
 
     override suspend fun close() = Unit
+}
+
+private class FastFailureDraftChatSession : HermesChatSession {
+    override val events = MutableSharedFlow<HermesChatEvent>()
+    var createCalls = 0
+    var setFastCalls = 0
+    var submitCalls = 0
+    var closed = false
+
+    override suspend fun resume(
+        durableSessionId: DurableSessionId,
+        profile: String?,
+    ): ResumedChatSession = error("draft should be created")
+
+    override suspend fun createSession(
+        durableSessionId: DurableSessionId,
+        profile: String?,
+        workspacePath: String?,
+    ): ResumedChatSession {
+        createCalls += 1
+        return ResumedChatSession(
+            runtimeSessionId = RuntimeSessionId("runtime-fast-fail"),
+            durableSessionId = durableSessionId,
+            resumed = false,
+            messages = emptyList(),
+            running = false,
+            inflight = null,
+        )
+    }
+
+    override suspend fun setFast(runtimeSessionId: RuntimeSessionId, fast: Boolean) {
+        setFastCalls += 1
+        throw HermesChatTransportException("fast mode RPC failed transiently")
+    }
+
+    override suspend fun submitPrompt(
+        runtimeSessionId: RuntimeSessionId,
+        text: String,
+    ): PromptSubmission {
+        submitCalls += 1
+        return PromptSubmission("streaming")
+    }
+
+    override suspend fun close() {
+        closed = true
+    }
+}
+
+private class ProcessAwareDraftChatSession : HermesChatSession {
+    override val events = MutableSharedFlow<HermesChatEvent>()
+    var createCalls = 0
+    var submitCalls = 0
+    var processListCalls = 0
+    var closed = false
+
+    override suspend fun resume(
+        durableSessionId: DurableSessionId,
+        profile: String?,
+    ): ResumedChatSession = error("draft should be created")
+
+    override suspend fun createSession(
+        durableSessionId: DurableSessionId,
+        profile: String?,
+        workspacePath: String?,
+    ): ResumedChatSession {
+        createCalls += 1
+        return ResumedChatSession(
+            runtimeSessionId = RuntimeSessionId("runtime-processes"),
+            durableSessionId = durableSessionId,
+            resumed = false,
+            messages = emptyList(),
+            running = false,
+            inflight = null,
+        )
+    }
+
+    override suspend fun submitPrompt(
+        runtimeSessionId: RuntimeSessionId,
+        text: String,
+    ): PromptSubmission {
+        submitCalls += 1
+        return PromptSubmission("streaming")
+    }
+
+    override suspend fun loadProcessList(runtimeSessionId: RuntimeSessionId): List<ProcessRow> {
+        processListCalls += 1
+        // The prompt's background process only exists after the turn was accepted.
+        return if (submitCalls == 0) emptyList() else {
+            listOf(ProcessRow(processId = "proc-1", command = "npm run build", status = "running"))
+        }
+    }
+
+    override suspend fun close() {
+        closed = true
+    }
 }
 
 private class RecordingProjectDraftChatSession : HermesChatSession {
@@ -2582,38 +3740,50 @@ private class RecordingProjectDraftChatSession : HermesChatSession {
 
 private class ReasoningResumeChatSession(
     private val durableSessionId: DurableSessionId,
+    private val model: String = "gpt-5.6-sol",
 ) : HermesChatSession {
     override val events = emptyFlow<HermesChatEvent>()
+    var resumeCalls = 0
+    var fastRuntimeId: RuntimeSessionId? = null
+    var appliedFast: Boolean? = null
 
     override suspend fun resume(
         durableSessionId: DurableSessionId,
         profile: String?,
-    ): ResumedChatSession = ResumedChatSession(
-        runtimeSessionId = RuntimeSessionId("runtime-reasoning"),
-        durableSessionId = this.durableSessionId,
-        resumed = true,
-        messages = listOf(
-            JsonObject(
-                mapOf(
-                    "role" to JsonPrimitive("assistant"),
-                    "text" to JsonPrimitive(""),
-                    "reasoning_content" to JsonPrimitive("Recovered reasoning"),
+    ): ResumedChatSession {
+        resumeCalls += 1
+        return ResumedChatSession(
+            runtimeSessionId = RuntimeSessionId("runtime-reasoning"),
+            durableSessionId = this.durableSessionId,
+            resumed = true,
+            messages = listOf(
+                JsonObject(
+                    mapOf(
+                        "role" to JsonPrimitive("assistant"),
+                        "text" to JsonPrimitive(""),
+                        "reasoning_content" to JsonPrimitive("Recovered reasoning"),
+                    ),
+                ),
+                JsonObject(
+                    mapOf(
+                        "role" to JsonPrimitive("tool"),
+                        "name" to JsonPrimitive("terminal"),
+                        "context" to JsonPrimitive("pwd"),
+                    ),
                 ),
             ),
-            JsonObject(
-                mapOf(
-                    "role" to JsonPrimitive("tool"),
-                    "name" to JsonPrimitive("terminal"),
-                    "context" to JsonPrimitive("pwd"),
-                ),
-            ),
-        ),
-        running = false,
-        inflight = null,
-        model = "gpt-5.6-sol",
-        provider = "openai-codex",
-        reasoningEffort = "medium",
-    )
+            running = false,
+            inflight = null,
+            model = model,
+            provider = "openai-codex",
+            reasoningEffort = "medium",
+        )
+    }
+
+    override suspend fun setFast(runtimeSessionId: RuntimeSessionId, fast: Boolean) {
+        fastRuntimeId = runtimeSessionId
+        appliedFast = fast
+    }
 
     override suspend fun submitPrompt(
         runtimeSessionId: RuntimeSessionId,
