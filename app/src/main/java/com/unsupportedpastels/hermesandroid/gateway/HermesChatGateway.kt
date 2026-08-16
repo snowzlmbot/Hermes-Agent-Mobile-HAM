@@ -164,6 +164,7 @@ enum class HermesChatResponseStatus {
 
 data class HermesChatResponse(
     val status: HermesChatResponseStatus,
+    val nextApproval: HermesChatEvent.ApprovalRequest? = null,
 )
 
 /**
@@ -484,6 +485,7 @@ interface HermesChatSession {
         runtimeSessionId: RuntimeSessionId,
         choice: String,
         all: Boolean = false,
+        requestId: String? = null,
     ): HermesChatResponse = throw HermesChatProtocolException("Approval response is not available")
 
     suspend fun interruptSession(
@@ -578,8 +580,19 @@ class HermesChatGateway(
 
 private data class PendingApproval(
     val requestId: String?,
+    val command: String?,
+    val description: String?,
     val choices: List<String>,
-)
+) {
+    fun toEvent(sessionId: RuntimeSessionId): HermesChatEvent.ApprovalRequest =
+        HermesChatEvent.ApprovalRequest(
+            sessionId = sessionId,
+            requestId = requestId,
+            command = command,
+            description = description,
+            choices = choices,
+        )
+}
 
 class HermesChatConnection internal constructor(
     private val socket: HermesChatSocket,
@@ -823,11 +836,20 @@ class HermesChatConnection internal constructor(
         runtimeSessionId: RuntimeSessionId,
         choice: String,
         all: Boolean,
+        requestId: String?,
     ): HermesChatResponse {
         val boundedChoice = boundedRpcInput(choice, HERMES_CHAT_MAX_EVENT_CHOICE_CHARS, "approval choice")
         val sessionKey = boundedRpcInput(runtimeSessionId.value, HERMES_CHAT_MAX_EVENT_ID_CHARS, "runtime session ID")
+        val boundedRequestId = requestId?.let {
+            boundedRpcInput(it, HERMES_CHAT_MAX_EVENT_ID_CHARS, "request ID")
+        }
         synchronized(interactionLock) {
-            val pending = pendingApprovals[sessionKey]?.peekFirst()
+            val queue = pendingApprovals[sessionKey]
+            val pending = if (boundedRequestId == null) {
+                queue?.peekLast()
+            } else {
+                queue?.firstOrNull { it.requestId == boundedRequestId }
+            }
                 ?: throw HermesChatProtocolException("No pending approval choices for this session")
             if (boundedChoice !in pending.choices) {
                 throw HermesChatProtocolException("Approval choice was not advertised")
@@ -835,16 +857,30 @@ class HermesChatConnection internal constructor(
         }
         val params = buildJsonObject {
             put("session_id", sessionKey)
+            boundedRequestId?.let { put("request_id", it) }
             put("choice", boundedChoice)
             put("all", all)
         }
         val response = parseInteractionResponse(request("approval.respond", params))
-        synchronized(interactionLock) {
+        val nextApproval = synchronized(interactionLock) {
             val queue = pendingApprovals[sessionKey]
-            if (queue != null && queue.isNotEmpty()) queue.removeFirst()
+            if (response.status in setOf(
+                    HermesChatResponseStatus.Ok,
+                    HermesChatResponseStatus.Resolved,
+                    HermesChatResponseStatus.Expired,
+                )
+            ) {
+                when {
+                    queue == null -> Unit
+                    all -> queue.clear()
+                    boundedRequestId != null -> queue.removeIf { it.requestId == boundedRequestId }
+                    queue.isNotEmpty() -> queue.removeLast()
+                }
+            }
             if (queue == null || queue.isEmpty()) pendingApprovals.remove(sessionKey)
+            queue?.peekLast()?.toEvent(runtimeSessionId)
         }
-        return response
+        return response.copy(nextApproval = nextApproval)
     }
 
     override suspend fun interruptSession(
@@ -862,6 +898,7 @@ class HermesChatConnection internal constructor(
     private fun parseInteractionResponse(result: JsonObject): HermesChatResponse {
         val wireStatus = result.stringValue("status")
             ?: result.booleanValue("resolved")?.let { resolved -> if (resolved) "ok" else "expired" }
+            ?: result.longValue("resolved")?.let { resolved -> if (resolved > 0) "ok" else "expired" }
             ?: throw HermesChatProtocolException("Hermes interaction response was incomplete")
         return HermesChatResponse(HermesChatResponseStatus.fromWire(wireStatus))
     }
@@ -1337,7 +1374,14 @@ class HermesChatConnection internal constructor(
                     )
                     synchronized(interactionLock) {
                         pendingApprovals.getOrPut(sessionId.value) { ArrayDeque() }
-                            .addLast(PendingApproval(approval.requestId, choices))
+                            .addLast(
+                                PendingApproval(
+                                    requestId = approval.requestId,
+                                    command = approval.command,
+                                    description = approval.description,
+                                    choices = choices,
+                                ),
+                            )
                     }
                     approval
                 }

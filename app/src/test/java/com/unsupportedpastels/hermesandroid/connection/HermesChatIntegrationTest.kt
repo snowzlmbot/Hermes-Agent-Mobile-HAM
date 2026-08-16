@@ -1294,6 +1294,7 @@ class HermesChatIntegrationTest {
             listOf(Triple(session.runtimeSessionId, "allow", true)),
             session.approvalCalls,
         )
+        assertEquals(listOf("approval-1"), session.approvalRequestIds)
         assertEquals(
             RunInteractionLifecycle.Responding,
             viewModel.snapshots.value.chatSessions.getValue(durableId).runState.approval?.lifecycle,
@@ -1307,6 +1308,50 @@ class HermesChatIntegrationTest {
             RunInteractionLifecycle.Expired,
             viewModel.snapshots.value.chatSessions.getValue(durableId).runState.approval?.lifecycle,
         )
+    }
+
+    @Test
+    fun approvalControllerPromotesTheNextQueuedApprovalAfterResolvingTheLatest() = runTest(dispatcher) {
+        val session = ControllerChatSession()
+        val viewModel = chatViewModel(session)
+        advanceUntilIdle()
+
+        viewModel.openSession(durableId)
+        advanceUntilIdle()
+        val firstApproval = HermesChatEvent.ApprovalRequest(
+            sessionId = session.runtimeSessionId,
+            requestId = "approval-1",
+            command = "first command",
+            description = "First approval",
+            choices = listOf("once", "deny"),
+        )
+        session.emit(firstApproval)
+        session.emit(
+            HermesChatEvent.ApprovalRequest(
+                sessionId = session.runtimeSessionId,
+                requestId = "approval-2",
+                command = "second command",
+                description = "Second approval",
+                choices = listOf("session", "deny"),
+            ),
+        )
+        advanceUntilIdle()
+
+        val response = viewModel.respondToApproval(durableId, "session")
+        runCurrent()
+        session.approvalResponse.complete(
+            HermesChatResponse(
+                status = HermesChatResponseStatus.Ok,
+                nextApproval = firstApproval,
+            ),
+        )
+        response.join()
+
+        val promoted = viewModel.snapshots.value.chatSessions.getValue(durableId).runState.approval
+        assertEquals("approval-1", promoted?.requestId)
+        assertEquals("First approval", promoted?.descriptionPreview)
+        assertEquals(listOf("once", "deny"), promoted?.choices)
+        assertEquals(RunInteractionLifecycle.Pending, promoted?.lifecycle)
     }
 
     @Test
@@ -2741,6 +2786,7 @@ private class ControllerChatSession(
     override val events: Flow<HermesChatEvent> = channel.receiveAsFlow()
     val clarificationCalls = mutableListOf<Pair<String, String>>()
     val approvalCalls = mutableListOf<Triple<RuntimeSessionId, String, Boolean>>()
+    val approvalRequestIds = mutableListOf<String?>()
     val interruptCalls = mutableListOf<RuntimeSessionId>()
     val steerCalls = mutableListOf<Pair<RuntimeSessionId, String>>()
     val usageCalls = mutableListOf<RuntimeSessionId>()
@@ -2792,8 +2838,10 @@ private class ControllerChatSession(
         runtimeSessionId: RuntimeSessionId,
         choice: String,
         all: Boolean,
+        requestId: String?,
     ): HermesChatResponse {
         approvalCalls += Triple(runtimeSessionId, choice, all)
+        approvalRequestIds += requestId
         return if (approvalNonCooperative) {
             withContext(NonCancellable) { approvalResponse.await() }
         } else {
