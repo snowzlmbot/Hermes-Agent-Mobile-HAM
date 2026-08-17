@@ -23,6 +23,8 @@ Host-file contents are downloaded only after an explicit preview, play, save, or
 
 HAM sends data only to the Hermes server origin you configure in the app. HAM does **not** operate a shared hosted backend and does not include analytics, advertising, tracking, or telemetry SDKs.
 
+When you explicitly choose **Voice input**, HAM opens an installed Android speech-recognition activity. That service may capture and process audio under its own privacy policy; HAM receives only the recognized text and does not store the recording.
+
 Your chosen server’s operator and configuration determine how server-side data is processed, retained, logged, and secured. Review that server’s policies before connecting, especially if it is operated by someone else.
 
 ## Android permissions
@@ -31,7 +33,7 @@ Your chosen server’s operator and configuration determine how server-side data
 - **Notifications** — optional alerts for completed turns and requests requiring your attention.
 - **Foreground service / data sync** — maintain truthful, visible status while an active HAM-started turn is running.
 
-HAM does not request location, contacts, camera, microphone, or storage-wide file permissions. Attachments use Android’s user-mediated document picker.
+HAM does not request location, contacts, camera, microphone, or storage-wide file permissions. Attachments use Android’s user-mediated document picker. Voice input is provided by an installed Android speech service, which may request microphone access in its own interface.
 
 ## Security
 

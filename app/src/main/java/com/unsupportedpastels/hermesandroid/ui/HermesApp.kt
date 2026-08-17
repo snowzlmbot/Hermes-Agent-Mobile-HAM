@@ -127,6 +127,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.runtime.Composable
@@ -257,6 +258,8 @@ import com.unsupportedpastels.hermesandroid.session.toggleBulkSelection
 import com.unsupportedpastels.hermesandroid.share.SharePayload
 import com.unsupportedpastels.hermesandroid.theme.HermesAndroidTheme
 import com.unsupportedpastels.hermesandroid.theme.LocalHermesSemanticColors
+import com.unsupportedpastels.hermesandroid.voice.DeviceVoiceInputContract
+import com.unsupportedpastels.hermesandroid.voice.VoiceInputPolicy
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -849,6 +852,7 @@ fun HermesApp(
                     SessionDetailScreen(
                         session = session,
                         chat = chat,
+                        voiceInputScopeKey = draftKey,
                         draft = drafts[draftKey].orEmpty(),
                         onDraftChanged = { updated ->
                             drafts[draftKey] = updated
@@ -4120,6 +4124,7 @@ internal fun isTranscriptAtTrueEnd(
 private fun SessionDetailScreen(
     session: SessionSummary,
     chat: ChatSessionSnapshot,
+    voiceInputScopeKey: String,
     draft: String,
     onDraftChanged: (String) -> Unit,
     canSend: Boolean,
@@ -4183,6 +4188,18 @@ private fun SessionDetailScreen(
         workspacePath == null
     var attachmentError by remember(session.id) { mutableStateOf<String?>(null) }
     var pendingSend by remember(session.id) { mutableStateOf<Pair<String, Int>?>(null) }
+    var pendingVoiceInputScopeKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val currentVoiceInputScopeKey by rememberUpdatedState(voiceInputScopeKey)
+    val currentDraft by rememberUpdatedState(draft)
+    val currentOnDraftChanged by rememberUpdatedState(onDraftChanged)
+    val voiceInputAvailable = remember(context) { DeviceVoiceInputContract.isAvailable(context) }
+    val voiceInputLauncher = rememberLauncherForActivityResult(DeviceVoiceInputContract()) { recognized ->
+        val targetScopeKey = pendingVoiceInputScopeKey
+        pendingVoiceInputScopeKey = null
+        if (recognized != null && targetScopeKey == currentVoiceInputScopeKey) {
+            currentOnDraftChanged(VoiceInputPolicy.mergeDraft(currentDraft, recognized))
+        }
+    }
     val attachmentPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments(),
     ) { uris ->
@@ -4654,6 +4671,24 @@ private fun SessionDetailScreen(
                                     showHostFiles = true
                                 },
                             )
+                            if (voiceInputAvailable) {
+                                DropdownMenuItem(
+                                    text = { Text("Voice input") },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.Mic, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        attachmentMenuOpen = false
+                                        attachmentError = null
+                                        pendingVoiceInputScopeKey = voiceInputScopeKey
+                                        runCatching { voiceInputLauncher.launch(Unit) }
+                                            .onFailure {
+                                                pendingVoiceInputScopeKey = null
+                                                attachmentError = "Voice input is unavailable"
+                                            }
+                                    },
+                                )
+                            }
                         }
                     }
                     BasicTextField(
