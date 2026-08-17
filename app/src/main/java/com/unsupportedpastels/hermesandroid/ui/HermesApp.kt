@@ -852,7 +852,11 @@ fun HermesApp(
                     SessionDetailScreen(
                         session = session,
                         chat = chat,
-                        voiceInputScopeKey = draftKey,
+                        voiceInputScopeKey = VoiceInputPolicy.scopeKey(
+                            serverOrigin = serverOrigin?.value,
+                            profile = snapshot.selectedProfile,
+                            durableSessionId = session.id.value,
+                        ),
                         draft = drafts[draftKey].orEmpty(),
                         onDraftChanged = { updated ->
                             drafts[draftKey] = updated
