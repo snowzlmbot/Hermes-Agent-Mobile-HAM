@@ -1,10 +1,25 @@
 package com.unsupportedpastels.hermesandroid.voice
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
 class VoiceInputPolicyTest {
+    @Test
+    fun scopesPendingResultsByOriginProfileAndDurableSession() {
+        val baseline = VoiceInputPolicy.scopeKey("https://one.example", "default", "session-1")
+
+        assertEquals(baseline, VoiceInputPolicy.scopeKey("https://one.example", "default", "session-1"))
+        assertNotEquals(baseline, VoiceInputPolicy.scopeKey("https://two.example", "default", "session-1"))
+        assertNotEquals(baseline, VoiceInputPolicy.scopeKey("https://one.example", "work", "session-1"))
+        assertNotEquals(baseline, VoiceInputPolicy.scopeKey("https://one.example", "default", "session-2"))
+        assertNotEquals(
+            VoiceInputPolicy.scopeKey("https://one.example", "a|1:b", "session-1"),
+            VoiceInputPolicy.scopeKey("https://one.example|a", "b", "1:session-1"),
+        )
+    }
+
     @Test
     fun selectsFirstNonBlankResultAndTrimsIt() {
         assertEquals(
